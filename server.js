@@ -1,16 +1,39 @@
 const express = require('express');
 const dotenv = require('dotenv');
 
-// Load environment variables from .env file
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const API_URL = 'https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions';
+const REQUEST_TIMEOUT = 55000;
 const ALLOWED_ORIGINS = new Set([
   'https://iflytek.github.io',
   'http://localhost:5173',
   'http://127.0.0.1:5173'
 ]);
+
+async function pipeStream(response, res) {
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  const reader = response.body.getReader();
+
+  while (true) {
+    const { value, done } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    res.write(Buffer.from(value));
+  }
+
+  res.end();
+}
 
 function applyCors(req, res) {
   const requestOrigin = req.headers.origin;
@@ -24,7 +47,6 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
 }
 
-// Middleware
 app.use((req, res, next) => {
   applyCors(req, res);
 
@@ -36,17 +58,20 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// Proxy endpoint for chat completions
 app.post('/api/chat', async (req, res) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+  const requestBody = req.body && typeof req.body === 'object' ? req.body : {};
+
   try {
-    const response = await fetch('https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions', {
+    const response = await fetch(API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        // The API key is securely used here on the backend
         'Authorization': `Bearer ${process.env.VITE_API_KEY}`
       },
-      body: JSON.stringify({ ...req.body, stream: false })
+      body: JSON.stringify(requestBody),
+      signal: controller.signal
     });
 
     if (!response.ok) {
@@ -54,11 +79,32 @@ app.post('/api/chat', async (req, res) => {
       return res.status(response.status).send(`API Error: ${response.status} ${errorText}`);
     }
 
+    if (requestBody.stream && response.body) {
+      await pipeStream(response, res);
+      return;
+    }
+
     const data = await response.json();
     res.json(data);
   } catch (error) {
     console.error('Proxy Error:', error);
+
+    if (res.headersSent) {
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+        res.end();
+      }
+      return;
+    }
+
+    if (controller.signal.aborted) {
+      res.status(504).json({ error: 'Gateway Timeout', details: 'Upstream request timed out' });
+      return;
+    }
+
     res.status(500).json({ error: 'Internal Server Error', details: error.message });
+  } finally {
+    clearTimeout(timeoutId);
   }
 });
 

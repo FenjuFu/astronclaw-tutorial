@@ -7,10 +7,7 @@
       </div>
       <div class="chat-messages" ref="messagesContainer">
         <div v-for="(msg, index) in messages" :key="index" :class="['message', msg.role]">
-          <div class="message-content">{{ msg.content }}</div>
-        </div>
-        <div v-if="isLoading" class="message assistant">
-          <div class="message-content loading">...</div>
+          <div :class="['message-content', { loading: msg.isPending }]">{{ msg.content }}</div>
         </div>
       </div>
       <div class="chat-input">
@@ -20,7 +17,20 @@
           :placeholder="i18n.placeholder"
           :disabled="isLoading"
         />
-        <button @click="sendMessage" :disabled="isLoading || !inputText.trim()">{{ i18n.send }}</button>
+        <button
+          v-if="isLoading"
+          @click="stopMessage"
+          class="stop-btn"
+        >
+          {{ i18n.stop }}
+        </button>
+        <button
+          v-else
+          @click="sendMessage"
+          :disabled="!inputText.trim()"
+        >
+          {{ i18n.send }}
+        </button>
       </div>
     </div>
     <div v-else class="chat-toggle" @click="toggleChat">
@@ -36,18 +46,22 @@ import { useData } from 'vitepress'
 const { lang } = useData()
 
 const isEn = computed(() => lang.value === 'en')
-const CHAT_REQUEST_TIMEOUT_MS = 12000
 const CHAT_ENDPOINT_FALLBACK = 'https://astronclaw-tutorial.vercel.app/api/chat'
+const REQUEST_TIMEOUT = 45000
 
 const i18n = computed(() => {
   return isEn.value ? {
     title: 'Learning Assistant',
     placeholder: 'What tool would you like to know about?...',
     send: 'Send',
+    stop: 'Stop',
     welcome: 'Hello! I am your learning assistant. What do you need? Which tool would you like to use (AstronClaw or Loomy)? I will recommend and guide you to the next step.',
     systemPrompt: `You are a project learning assistant. Your task is to ask the user what they need or which tool they want to use (AstronClaw or Loomy) and make recommendations, always guiding the user to the next step. Please keep your answers short and friendly. Be sure to answer the user's questions based on the content in the [Knowledge Base Reference] (if it exists).\n`,
     errorFallback: 'Sorry, I encountered some issues. Please try again later.',
     errorPrefix: 'Request failed: ',
+    thinking: 'Thinking...',
+    requestCanceled: 'Response stopped.',
+    requestTimeout: 'The response timed out. Please try again.',
     knowledgeBaseTitle: '\n\n[Knowledge Base Reference]\n',
     chapter: 'Chapter: ',
     content: 'Content: '
@@ -55,10 +69,14 @@ const i18n = computed(() => {
     title: '学习助手 (Learning Assistant)',
     placeholder: '你想了解什么工具？...',
     send: '发送',
+    stop: '停止',
     welcome: '你好！我是你的学习助手。请问你有什么需求？希望使用哪款工具（AstronClaw 或 Loomy）？我会为你推荐并引导你进行下一步操作。',
     systemPrompt: `你是一个项目学习助手，你的任务是提问用户有什么需求/希望使用哪款工具（AstronClaw 或 Loomy）并进行推荐，永远引导用户进行下一步操作。请保持回答简短友好。请务必基于【知识库参考信息】中的内容来回答用户的问题（如果存在）。\n`,
     errorFallback: '抱歉，我遇到了一些问题，请稍后再试。',
     errorPrefix: '请求失败: ',
+    thinking: '正在思考...',
+    requestCanceled: '回答已停止。',
+    requestTimeout: '回答超时，请重试。',
     knowledgeBaseTitle: '\n\n【知识库参考信息】\n',
     chapter: '章节: ',
     content: '内容: '
@@ -69,6 +87,7 @@ const isOpen = ref(false)
 const isLoading = ref(false)
 const inputText = ref('')
 const messagesContainer = ref(null)
+const currentController = ref(null)
 
 const messages = ref([
   {
@@ -116,13 +135,8 @@ const scrollToBottom = async () => {
 
 function searchDocs(query) {
   if (!docsIndex.length) return ''
-
-  const currentLangDocs = docsIndex.filter(doc => {
-    if (isEn.value) {
-      return doc.url.startsWith('/en/')
-    }
-    return !doc.url.startsWith('/en/')
-  })
+  const currentLang = isEn.value ? 'en' : 'zh'
+  const currentLangDocs = docsIndex.filter(doc => doc.lang === currentLang)
 
   if (!currentLangDocs.length) return ''
   const keywords = query.toLowerCase().match(/[a-z0-9]+|[\u4e00-\u9fa5]/g) || []
@@ -164,22 +178,30 @@ function getChatEndpoints() {
   }
 
   const currentOrigin = window.location.origin
+  const fallbackOrigin = CHAT_ENDPOINT_FALLBACK.replace('/api/chat', '')
   const endpoints = ['/api/chat']
 
-  if (currentOrigin !== CHAT_ENDPOINT_FALLBACK.replace('/api/chat', '')) {
+  if (currentOrigin !== fallbackOrigin) {
     endpoints.push(CHAT_ENDPOINT_FALLBACK)
   }
 
   return endpoints
 }
 
-async function requestChatCompletion(payload) {
+const updateAssistantMessage = async (message, content, isPending = false) => {
+  message.content = content
+  message.isPending = isPending
+  await scrollToBottom()
+}
+
+const requestChat = async (payload, signal) => {
   const endpoints = getChatEndpoints()
   let lastError = null
 
   for (const endpoint of endpoints) {
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(new Error(`timeout:${endpoint}`)), CHAT_REQUEST_TIMEOUT_MS)
+    if (signal.aborted) {
+      throw lastError || new Error('Request aborted')
+    }
 
     try {
       const response = await fetch(endpoint, {
@@ -187,25 +209,101 @@ async function requestChatCompletion(payload) {
         headers: {
           'Content-Type': 'application/json'
         },
-        signal: controller.signal,
+        signal,
         body: JSON.stringify(payload)
       })
 
       if (!response.ok) {
         const errText = await response.text()
-        throw new Error(`API error (${endpoint}): ${response.status} ${errText}`)
+        throw new Error(`API error: ${response.status} ${errText}`)
       }
 
-      return await response.json()
+      return response
     } catch (error) {
-      lastError = error
+      if (signal.aborted) {
+        throw error
+      }
+
+      lastError = new Error(`${endpoint}: ${error.message}`)
       console.error(`Error calling AI endpoint ${endpoint}:`, error)
-    } finally {
-      clearTimeout(timeoutId)
     }
   }
 
   throw lastError ?? new Error('No chat endpoint available')
+}
+
+const readStreamResponse = async (response, assistantMessage) => {
+  if (!response.body) {
+    throw new Error('Empty response body')
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let content = ''
+
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      const trimmedLine = line.trim()
+
+      if (!trimmedLine || !trimmedLine.startsWith('data:')) {
+        continue
+      }
+
+      const data = trimmedLine.slice(5).trim()
+
+      if (data === '[DONE]') {
+        if (!content) {
+          await updateAssistantMessage(assistantMessage, i18n.value.errorFallback)
+        }
+        return
+      }
+
+      const parsed = JSON.parse(data)
+      const delta = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.message?.content ?? ''
+
+      if (delta) {
+        content += delta
+        await updateAssistantMessage(assistantMessage, content, true)
+      }
+    }
+
+    if (done) {
+      break
+    }
+  }
+
+  if (buffer.trim().startsWith('data:')) {
+    const data = buffer.trim().slice(5).trim()
+
+    if (data && data !== '[DONE]') {
+      const parsed = JSON.parse(data)
+      const delta = parsed.choices?.[0]?.delta?.content ?? parsed.choices?.[0]?.message?.content ?? ''
+
+      if (delta) {
+        content += delta
+      }
+    }
+  }
+
+  if (content) {
+    await updateAssistantMessage(assistantMessage, content)
+    return
+  }
+
+  await updateAssistantMessage(assistantMessage, i18n.value.errorFallback)
+}
+
+const stopMessage = () => {
+  if (currentController.value) {
+    currentController.value.abort('user-stop')
+  }
 }
 
 const sendMessage = async () => {
@@ -219,35 +317,66 @@ const sendMessage = async () => {
 
   const context = searchDocs(text)
   const systemPrompt = `${i18n.value.systemPrompt}${context}`
+  const requestMessages = messages.value
+    .filter(m => !m.isPending)
+    .filter(m => m.role !== 'assistant' || (m.content !== i18n.value.errorFallback && !m.content.startsWith(i18n.value.errorPrefix)))
+    .map(m => ({ role: m.role, content: m.content }))
+  const assistantMessage = {
+    role: 'assistant',
+    content: i18n.value.thinking,
+    isPending: true
+  }
+  const controller = new AbortController()
+  let isTimedOut = false
+  const timeoutId = window.setTimeout(() => {
+    isTimedOut = true
+    controller.abort('timeout')
+  }, REQUEST_TIMEOUT)
+
+  currentController.value = controller
+  messages.value.push(assistantMessage)
+  await scrollToBottom()
 
   try {
-    const data = await requestChatCompletion({
+    const response = await requestChat({
       model: 'astron-code-latest',
-      stream: false,
+      stream: true,
       messages: [
         {
           role: 'system',
           content: systemPrompt
         },
-        ...messages.value
-          .filter(m => m.role !== 'assistant' || (m.content !== i18n.value.errorFallback && !m.content.startsWith(i18n.value.errorPrefix)))
-          .map(m => ({ role: m.role, content: m.content }))
+        ...requestMessages
       ]
-    })
+    }, controller.signal)
 
-    if (data.choices && data.choices.length > 0) {
-      messages.value.push({
-        role: 'assistant',
-        content: data.choices[0].message.content
-      })
+    const contentType = response.headers.get('content-type') || ''
+
+    if (contentType.includes('text/event-stream')) {
+      await readStreamResponse(response, assistantMessage)
     } else {
-      messages.value.push({ role: 'assistant', content: i18n.value.errorFallback })
+      const data = await response.json()
+      const content = data.choices?.[0]?.message?.content
+      await updateAssistantMessage(assistantMessage, content || i18n.value.errorFallback)
     }
   } catch (error) {
     console.error('Error calling AI:', error)
-    messages.value.push({ role: 'assistant', content: `${i18n.value.errorPrefix}${error.message}` })
+    if (controller.signal.aborted) {
+      if (isTimedOut) {
+        await updateAssistantMessage(assistantMessage, i18n.value.requestTimeout)
+      } else if (!assistantMessage.content || assistantMessage.content === i18n.value.thinking) {
+        await updateAssistantMessage(assistantMessage, i18n.value.requestCanceled)
+      } else {
+        assistantMessage.isPending = false
+      }
+    } else {
+      await updateAssistantMessage(assistantMessage, `${i18n.value.errorPrefix}${error.message}`)
+    }
   } finally {
+    window.clearTimeout(timeoutId)
+    currentController.value = null
     isLoading.value = false
+    assistantMessage.isPending = false
     scrollToBottom()
   }
 }
@@ -446,6 +575,10 @@ const sendMessage = async () => {
   border-radius: 6px;
   cursor: pointer;
   font-weight: 500;
+}
+
+.chat-input .stop-btn {
+  background-color: #d93025;
 }
 
 .chat-input button:disabled {
