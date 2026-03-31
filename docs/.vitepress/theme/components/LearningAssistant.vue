@@ -62,6 +62,8 @@ const i18n = computed(() => {
     thinking: 'Thinking...',
     requestCanceled: 'Response stopped.',
     requestTimeout: 'The response timed out. Please try again.',
+    replyInEnglish: 'Reply entirely in English. If earlier messages use Chinese, ignore that and continue in English. If you quote Chinese source text, add a brief English explanation.',
+    replyInChinese: '请全程使用中文回复。如果引用英文资料，请补充简短中文解释。',
     knowledgeBaseTitle: '\n\n[Knowledge Base Reference]\n',
     chapter: 'Chapter: ',
     content: 'Content: '
@@ -77,6 +79,8 @@ const i18n = computed(() => {
     thinking: '正在思考...',
     requestCanceled: '回答已停止。',
     requestTimeout: '回答超时，请重试。',
+    replyInEnglish: 'Please reply entirely in English. Ignore earlier Chinese replies and continue in English. If you quote Chinese source text, add a brief English explanation.',
+    replyInChinese: '请全程使用中文回复。如果引用英文资料，请补充简短中文解释。',
     knowledgeBaseTitle: '\n\n【知识库参考信息】\n',
     chapter: '章节: ',
     content: '内容: '
@@ -170,6 +174,29 @@ function searchDocs(query) {
   if (results.length === 0) return ''
 
   return i18n.value.knowledgeBaseTitle + results.map(r => `${i18n.value.chapter}${r.heading}\n${i18n.value.content}${r.content}`).join('\n\n')
+}
+
+function detectPreferredLanguage(text) {
+  const englishCount = (text.match(/[A-Za-z]/g) || []).length
+  const chineseCount = (text.match(/[\u3400-\u9fff]/g) || []).length
+
+  if (isEn.value) {
+    return 'en'
+  }
+
+  if (englishCount >= 3 && englishCount >= chineseCount * 2) {
+    return 'en'
+  }
+
+  return 'zh'
+}
+
+function buildSystemPrompt(text, context) {
+  const languageInstruction = detectPreferredLanguage(text) === 'en'
+    ? i18n.value.replyInEnglish
+    : i18n.value.replyInChinese
+
+  return `${i18n.value.systemPrompt}${languageInstruction}\n${context}`
 }
 
 function getChatEndpoints() {
@@ -316,7 +343,7 @@ const sendMessage = async () => {
   scrollToBottom()
 
   const context = searchDocs(text)
-  const systemPrompt = `${i18n.value.systemPrompt}${context}`
+  const systemPrompt = buildSystemPrompt(text, context)
   const requestMessages = messages.value
     .filter(m => !m.isPending)
     .filter(m => m.role !== 'assistant' || (m.content !== i18n.value.errorFallback && !m.content.startsWith(i18n.value.errorPrefix)))
